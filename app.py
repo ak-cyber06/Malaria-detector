@@ -4,52 +4,154 @@ import streamlit as st
 import tensorflow as tf
 from PIL import Image
 
-st.set_page_config(page_title="Malaria cell classifier")
+st.set_page_config(page_title="Malaria cell classifier", page_icon="🔬")
+
 
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model("malaria.keras")
 
+
 model = load_model()
 
-def prob_uninfected(img):
+
+def prob_infected(img):
     x = np.array(img.convert("RGB").resize((128, 128)), dtype="float32")[None]
-    return float(model.predict(x, verbose=0)[0][0])
+    return 1.0 - float(model.predict(x, verbose=0)[0][0])
 
-st.title("Malaria cell classifier")
-st.caption("Student research demo. Not for clinical use.")
 
-tab1, tab2 = st.tabs(["Single image", "Batch accuracy"])
+def confidence_label(conf):
+    if conf >= 0.90:
+        return "High confidence"
+    if conf >= 0.70:
+        return "Moderate confidence"
+    return "Low confidence"
+
+
+def safe_div(a, b):
+    return a / b if b else None
+
+
+def pct(v):
+    return "n/a" if v is None else f"{v:.1%}"
+
+
+st.title("🔬 Malaria cell classifier")
+st.caption("AI-assisted screening of single blood cell images (thin smear). Student research demo, not for clinical use.")
+
+tab1, tab2, tab3 = st.tabs(["Single image", "Batch accuracy", "About"])
 
 with tab1:
     f = st.file_uploader("Upload one cell image", type=["png", "jpg", "jpeg"], key="single")
     if f:
         img = Image.open(f)
-        st.image(img, width=200)
-        p = prob_uninfected(img)
-        st.write(f"Uninfected: {p:.1%}")
-        st.write(f"Infected: {1 - p:.1%}")
+        p_inf = prob_infected(img)
+        p_unin = 1 - p_inf
+        conf = max(p_inf, p_unin)
+        left, right = st.columns([1, 2])
+        with left:
+            st.image(img, caption=f.name, width=180)
+        with right:
+            if p_inf >= 0.5:
+                st.error("Result: likely INFECTED (malaria parasite pattern detected)")
+            else:
+                st.success("Result: likely UNINFECTED (no parasite pattern detected)")
+            st.metric("Model confidence", f"{conf:.1%}")
+            st.caption(confidence_label(conf))
+        st.write("Probability breakdown")
+        st.progress(float(p_inf), text=f"Infected: {p_inf:.1%}")
+        st.progress(float(p_unin), text=f"Uninfected: {p_unin:.1%}")
+        if conf < 0.70:
+            st.warning("The model is not confident about this cell. Treat the result as uncertain and have it checked by a trained technician.")
+        else:
+            st.info("This is a screening aid. A positive or negative result should be confirmed by a trained technician using a microscope.")
 
 with tab2:
+    st.write("Upload cells whose true label you already know. The app compares its predictions with your labels and scores itself.")
     inf = st.file_uploader("Infected cell images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="inf")
     uninf = st.file_uploader("Uninfected cell images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="uninf")
+
     if st.button("Calculate accuracy"):
-        tp = fn = tn = fp = 0
-        for f in inf:
-            if prob_uninfected(Image.open(f)) < 0.5:
-                tp += 1
-            else:
-                fn += 1
-        for f in uninf:
-            if prob_uninfected(Image.open(f)) >= 0.5:
-                tn += 1
-            else:
-                fp += 1
-        total = tp + fn + tn + fp
-        if total == 0:
+        items = [(x, "Infected") for x in inf] + [(x, "Uninfected") for x in uninf]
+        if not items:
             st.warning("Upload some images first.")
         else:
-            st.subheader(f"Accuracy: {(tp + tn) / total:.1%} ({tp + tn} of {total} correct)")
-            st.table(pd.DataFrame([[tp, fn], [fp, tn]],
-                index=["Truly infected", "Truly uninfected"],
-                columns=["Predicted infected", "Predicted uninfected"]))
+            rows, images = [], []
+            bar = st.progress(0, text="Analysing images...")
+            for i, (x, true_label) in enumerate(items):
+                im = Image.open(x)
+                im.load()
+                p = prob_infected(im)
+                pred = "Infected" if p >= 0.5 else "Uninfected"
+                rows.append({"File": x.name, "True label": true_label, "Predicted": pred,
+                             "Confidence (%)": round(max(p, 1 - p) * 100, 1), "Correct": pred == true_label})
+                images.append(im)
+                bar.progress((i + 1) / len(items), text=f"Analysing image {i + 1} of {len(items)}")
+            bar.empty()
+            st.session_state["batch"] = (pd.DataFrame(rows), images)
+
+    if "batch" in st.session_state:
+        df, images = st.session_state["batch"]
+        tp = int(((df["True label"] == "Infected") & (df["Predicted"] == "Infected")).sum())
+        fn = int(((df["True label"] == "Infected") & (df["Predicted"] == "Uninfected")).sum())
+        fp = int(((df["True label"] == "Uninfected") & (df["Predicted"] == "Infected")).sum())
+        tn = int(((df["True label"] == "Uninfected") & (df["Predicted"] == "Uninfected")).sum())
+        total = len(df)
+        acc = (tp + tn) / total
+        sens = safe_div(tp, tp + fn)
+        spec = safe_div(tn, tn + fp)
+        prec = safe_div(tp, tp + fp)
+
+        st.subheader("Performance summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Accuracy", pct(acc), help="Share of all cells classified correctly")
+        c2.metric("Sensitivity", pct(sens), help="Of the truly infected cells, how many were caught")
+        c3.metric("Specificity", pct(spec), help="Of the truly uninfected cells, how many were correctly cleared")
+        c4.metric("Precision", pct(prec), help="Of the cells flagged infected, how many really were infected")
+
+        scores = {k: v for k, v in [("Accuracy", acc), ("Sensitivity", sens), ("Specificity", spec), ("Precision", prec)] if v is not None}
+        st.bar_chart(pd.DataFrame({"Score": scores}))
+
+        st.subheader("Confusion matrix")
+        a, b = st.columns(2)
+        a.success(f"Infected cells caught: **{tp}**")
+        b.error(f"Infected cells missed: **{fn}**")
+        c, d = st.columns(2)
+        c.warning(f"False alarms (healthy cells flagged infected): **{fp}**")
+        d.success(f"Healthy cells correctly cleared: **{tn}**")
+        st.table(pd.DataFrame([[tp, fn], [fp, tn]],
+                              index=["Truly infected", "Truly uninfected"],
+                              columns=["Predicted infected", "Predicted uninfected"]))
+
+        st.subheader("What this means")
+        st.write(f"The model classified {tp + tn} of {total} cells correctly ({pct(acc)}).")
+        if sens is not None:
+            st.write(f"It caught {tp} of {tp + fn} infected cells ({pct(sens)}). The {fn} missed cell(s) are the most serious kind of error in a screening tool.")
+        if spec is not None:
+            st.write(f"It correctly cleared {tn} of {tn + fp} healthy cells ({pct(spec)}), with {fp} false alarm(s).")
+        st.write("With a small set of images, one wrong cell shifts these percentages a lot, so treat this as an illustration rather than a final accuracy.")
+
+        st.subheader("Image by image")
+        show = df.copy()
+        show["Correct"] = show["Correct"].map({True: "✓", False: "✗"})
+        st.dataframe(show, hide_index=True)
+
+        wrong = df.index[~df["Correct"]].tolist()
+        if wrong:
+            with st.expander(f"Show the {len(wrong)} wrongly classified cell(s)"):
+                cols = st.columns(4)
+                for k, i in enumerate(wrong[:8]):
+                    cols[k % 4].image(images[i], width=120,
+                                      caption=f"True: {df.loc[i, 'True label']}, predicted: {df.loc[i, 'Predicted']} ({df.loc[i, 'Confidence (%)']}%)")
+
+        st.download_button("Download results (CSV)", df.to_csv(index=False), "results.csv", "text/csv")
+
+with tab3:
+    st.subheader("About this tool")
+    st.write("**What it does:** looks at one red blood cell image and estimates whether it shows a malaria parasite.")
+    st.write("**Model:** MobileNetV2 (a small neural network) retrained with transfer learning on the NIH malaria dataset of about 27,500 single-cell images from thin blood smears.")
+    st.write("**Accuracy:** about 93% on a held-out test set of 4,134 cells.")
+    st.subheader("Limitations")
+    st.write("- It only handles single-cell images, not whole slide photos.")
+    st.write("- It was trained on one dataset (thin smears, mostly P. falciparum), so it may do worse on images from other microscopes or stains.")
+    st.write("- It is a research prototype and cannot diagnose a patient.")
